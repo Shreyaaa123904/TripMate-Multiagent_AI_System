@@ -11,7 +11,8 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned: Playwright 1.58 has no Chromium build for ubuntu-latest (26.04) yet.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -26,5 +27,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
+      - name: Install Chromium for browser tests
+        run: python -m playwright install --with-deps chromium
+
+      - name: Pull PostgreSQL image for integration tests
+        run: docker pull postgres:16-alpine
+
+      # Unit, API, PostgreSQL integration, DB-recovery e2e and browser tests.
+      # No secrets: LLM/search providers are faked; PostgreSQL runs in Docker.
       - name: Run tests
+        env:
+          TRIPMATE_REQUIRE_INTEGRATION: "1"
         run: pytest
