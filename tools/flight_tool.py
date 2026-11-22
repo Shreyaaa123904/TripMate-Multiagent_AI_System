@@ -1,15 +1,13 @@
-import os 
-import re 
-import certifi
+import logging
+import os
+import re
 import airportsdata
 import pycountry
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()
+import config  # noqa: F401  (loads .env and CA bundle settings)
 
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+logger = logging.getLogger("tripmate.tools.flights")
 
 API_KEY = os.getenv("AVIATIONSTACK_API_KEY")
 
@@ -118,6 +116,53 @@ CITY_MAIN_AIRPORT = {
     "madrid": "MAD",
     "frankfurt": "FRA",
 }
+
+
+# Three-letter words that are also valid IATA codes but almost always mean
+# something else in a travel request (e.g. USA = Concord, THE = Teresina).
+NON_IATA_WORDS = {
+    "THE", "AND", "FOR", "ALL", "ANY", "ARE", "BUT", "CAN", "DAY", "GET",
+    "HOW", "NEW", "NOT", "NOW", "OFF", "OUR", "OUT", "PER", "SEE", "TOP",
+    "TWO", "WAY", "WHO", "WHY", "YOU", "BIG", "FUN", "VIA", "MAX", "MIN",
+    "LOW", "AIR", "BUS", "CAR", "EUR", "USD", "INR", "BDT", "AED", "JPY",
+    "GBP", "THB", "PDF", "API", "FAQ", "ASAP",
+}
+
+# Words that end the place name captured after "from"/"to".
+_CLAUSE_BREAK = re.compile(
+    r"\s+(?:with|including|include|includes|under|for|on|in|at|and|by|during|"
+    r"next|this|budget|within|around|plus|using|via|then|to|from)\b"
+    r"|[,.;:!?()\-]|\d",
+)
+
+
+def _trim_place(text: str) -> str:
+    """Keep only the leading place name from a captured clause.
+
+    "dhaka with flights, hotels and sightseeing" -> "dhaka"
+    """
+    text = text.strip()
+    match = _CLAUSE_BREAK.search(text)
+    if match:
+        text = text[: match.start()]
+    return text.strip()
+
+
+def _is_place_alias(text: str) -> bool:
+    key = text.lower().strip()
+    return key in CITY_MAIN_AIRPORT or key in COUNTRY_ALIASES
+
+
+def _direct_iata_codes(query: str):
+    """Uppercase three-letter tokens that are real IATA codes and not a
+    country/city alias or common word."""
+    codes = []
+    for token in re.findall(r"\b[A-Z]{3}\b", query):
+        if token in NON_IATA_WORDS or _is_place_alias(token):
+            continue
+        if token in AIRPORTS:
+            codes.append(token)
+    return codes
 
 
 def clean_text(text: str) -> str:
@@ -233,10 +278,20 @@ def resolve_location_to_iata(location: str):
 
     raw_location = location.strip()
 
+    # Known city/country names win over IATA lookups ("USA" is a country,
+    # not Concord airport).
+    alias_key = raw_location.lower()
+    if alias_key in CITY_MAIN_AIRPORT:
+        return CITY_MAIN_AIRPORT[alias_key]
+    if alias_key in COUNTRY_ALIASES:
+        airport = get_best_airport_for_country(COUNTRY_ALIASES[alias_key])
+        if airport:
+            return airport
+
     # Direct IATA code
     if re.fullmatch(r"[A-Za-z]{3}", raw_location):
         code = raw_location.upper()
-        if code in AIRPORTS:
+        if code in AIRPORTS and code not in NON_IATA_WORDS:
             return code
 
     location_clean = clean_text(raw_location)
@@ -255,8 +310,13 @@ def resolve_location_to_iata(location: str):
         if airport:
             return airport
 
-    # Exact city match from airport database
+    # Free-text clauses are not place names; don't fuzzy-match them.
+    if len(location_clean) < 3 or len(location_clean.split()) > 3:
+        return None
+
+    # City / airport-name match from airport database (whole words only)
     city_matches = []
+    word = re.compile(rf"\b{re.escape(location_clean)}\b")
 
     for iata, airport in AIRPORTS.items():
         city = str(airport.get("city", "")).lower().strip()
@@ -266,13 +326,15 @@ def resolve_location_to_iata(location: str):
 
         if city == location_clean:
             score += 100
-        elif location_clean in city:
+        elif word.search(city):
             score += 70
 
-        if location_clean in name:
+        if word.search(name):
             score += 50
 
-        if "international" in name:
+        # Tie-breaker only: never a match on its own (that made any
+        # unknown text resolve to the alphabetically last airport, ZZE).
+        if score > 0 and "international" in name:
             score += 10
 
         if score > 0:
@@ -320,6 +382,16 @@ def find_location_mentions(query: str):
     return unique_mentions
 
 
+def _other_location(text: str, exclude: str | None):
+    """First place mentioned in ``text`` that resolves to an airport other
+    than ``exclude``."""
+    for mention in find_location_mentions(text):
+        iata = resolve_location_to_iata(mention)
+        if iata and iata != exclude:
+            return iata
+    return None
+
+
 def parse_route(query: str):
     """
     Returns:
@@ -351,57 +423,46 @@ def parse_route(query: str):
         return None, None
 
     # Direct IATA code route: DAC to NRT
-    codes = re.findall(r"\b[A-Z]{3}\b", q)
+    codes = _direct_iata_codes(q)
 
     if len(codes) >= 2:
-        dep = codes[0].upper()
-        arr = codes[1].upper()
-        return dep, arr
+        return codes[0], codes[1]
 
     # Pattern: from X to Y
     match = re.search(
-        r"\bfrom\s+(.+?)\s+\bto\s+(.+?)(?:\s+(?:on|for|under|including|with|in|at)\b|[.!?]|$)",
+        r"\bfrom\s+(.+?)\s+\bto\s+(.+?)(?:\s+(?:on|for|under|including|with|in|at)\b|[.!?,]|$)",
         q_lower,
     )
 
     if match:
-        origin_text = match.group(1)
-        dest_text = match.group(2)
-
-        dep_iata = resolve_location_to_iata(origin_text)
-        arr_iata = resolve_location_to_iata(dest_text)
-
+        dep_iata = resolve_location_to_iata(_trim_place(match.group(1)))
+        arr_iata = resolve_location_to_iata(_trim_place(match.group(2)))
         return dep_iata, arr_iata
 
     # Pattern: to Y from X
     match = re.search(
-        r"\bto\s+(.+?)\s+\bfrom\s+(.+?)(?:\s+(?:on|for|under|including|with|in|at)\b|[.!?]|$)",
+        r"\bto\s+(.+?)\s+\bfrom\s+(.+?)(?:\s+(?:on|for|under|including|with|in|at)\b|[.!?,]|$)",
         q_lower,
     )
 
     if match:
-        dest_text = match.group(1)
-        origin_text = match.group(2)
-
-        dep_iata = resolve_location_to_iata(origin_text)
-        arr_iata = resolve_location_to_iata(dest_text)
-
+        dep_iata = resolve_location_to_iata(_trim_place(match.group(2)))
+        arr_iata = resolve_location_to_iata(_trim_place(match.group(1)))
         return dep_iata, arr_iata
 
-    # Pattern: flights from X
+    # Pattern: "<destination> trip from X ..." or "flights from X"
     match = re.search(r"\bfrom\s+(.+?)(?:[.!?]|$)", q_lower)
 
     if match:
-        origin_text = match.group(1)
-        dep_iata = resolve_location_to_iata(origin_text)
-        return dep_iata, None
+        dep_iata = resolve_location_to_iata(_trim_place(match.group(1)))
+        rest = q[: match.start()] + " " + q[match.end():]
+        return dep_iata, _other_location(rest, dep_iata)
 
     # Pattern: flights to X
     match = re.search(r"\bto\s+(.+?)(?:[.!?]|$)", q_lower)
 
     if match:
-        dest_text = match.group(1)
-        arr_iata = resolve_location_to_iata(dest_text)
+        arr_iata = resolve_location_to_iata(_trim_place(match.group(1)))
         return None, arr_iata
 
     # Fallback: find country/city mentions
@@ -491,7 +552,9 @@ def search_flights(query: str, limit: int = 10):
         response = requests.get(BASE_URL, params=params, timeout=30)
         data = response.json()
     except requests.exceptions.RequestException as e:
-        return f"Flight API request failed: {e}"
+        # str(e) can contain the request URL including the access key.
+        logger.warning("AviationStack request failed: %s", type(e).__name__)
+        return "Flight API request failed: the flight data service could not be reached."
     except ValueError:
         return "Flight API returned invalid JSON."
 

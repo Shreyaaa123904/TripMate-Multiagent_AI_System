@@ -35,6 +35,34 @@ function hideError() {
     errorBox.textContent = "";
 }
 
+const SAFE_LINK_PROTOCOL = /^(https?:|mailto:)/i;
+
+if (typeof DOMPurify !== "undefined") {
+    DOMPurify.addHook("afterSanitizeAttributes", function(node) {
+        if (node.tagName === "A") {
+            const href = node.getAttribute("href") || "";
+            if (!SAFE_LINK_PROTOCOL.test(href.trim())) {
+                node.removeAttribute("href");
+            } else {
+                node.setAttribute("target", "_blank");
+                node.setAttribute("rel", "noopener noreferrer");
+            }
+        }
+    });
+}
+
+// Model output can contain text copied from the web, so it is always
+// sanitised before being inserted as HTML. Without DOMPurify, show plain text.
+function renderMarkdown(element, markdown) {
+    if (typeof marked !== "undefined" && typeof DOMPurify !== "undefined") {
+        element.innerHTML = DOMPurify.sanitize(marked.parse(markdown), {
+            FORBID_TAGS: ["style", "form", "input", "button", "textarea", "select"]
+        });
+    } else {
+        element.textContent = markdown;
+    }
+}
+
 function showResult(answer, threadId) {
     latestAnswerMarkdown = answer;
 
@@ -42,11 +70,7 @@ function showResult(answer, threadId) {
     const resultBox = document.getElementById("resultBox");
     const threadInfo = document.getElementById("threadInfo");
 
-    if (typeof marked !== "undefined") {
-        resultBox.innerHTML = marked.parse(answer);
-    } else {
-        resultBox.innerText = answer;
-    }
+    renderMarkdown(resultBox, answer);
 
     threadInfo.textContent = `Thread ID: ${threadId}`;
 
@@ -175,6 +199,18 @@ function downloadPDF() {
             showError("Could not download PDF.");
         });
 }
+
+document.addEventListener("DOMContentLoaded", function() {
+    document.getElementById("sendBtn").addEventListener("click", sendMessage);
+    document.querySelector(".copy-btn").addEventListener("click", copyResult);
+    document.querySelector(".download-btn").addEventListener("click", downloadPDF);
+
+    document.querySelectorAll(".quick-prompts button[data-prompt]").forEach(function(button) {
+        button.addEventListener("click", function() {
+            setPrompt(button.dataset.prompt);
+        });
+    });
+});
 
 document.addEventListener("keydown", function(event) {
     if (event.ctrlKey && event.key === "Enter") {

@@ -23,4 +23,8 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)" || exit 1
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Forwarded headers are honoured only from FORWARDED_ALLOW_IPS (default:
+# 127.0.0.1, i.e. no external proxy is trusted). See README "Deployment".
+ENV FORWARDED_ALLOW_IPS=127.0.0.1
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--timeout-graceful-shutdown", "20"]
