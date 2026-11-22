@@ -5,3 +5,20 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Secrets — never bake into the image
+.env
+.env.*
+!.env.example
+.envrc
+
+# VCS, caches and dev-only files
+.git
+.github
+.gitignore
+__pycache__/
+*.py[cod]
+.pytest_cache/
+tests/
+requirements-dev.txt
+pytest.ini
