@@ -10,9 +10,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-RUN useradd --create-home --uid 1000 appuser
+# Application code stays root-owned and read-only for the runtime user.
+COPY . .
 
-COPY --chown=appuser:appuser . .
+RUN useradd --create-home --uid 1000 appuser \
+    && chmod -R a+rX,go-w /app
 
 USER appuser
 

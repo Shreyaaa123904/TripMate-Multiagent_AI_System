@@ -16,9 +16,9 @@ venv.bak/
 .git
 .github
 .gitignore
-__pycache__/
-*.py[cod]
-.pytest_cache/
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
 tests/
 requirements-dev.txt
 pytest.ini
