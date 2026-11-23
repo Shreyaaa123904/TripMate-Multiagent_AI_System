@@ -425,9 +425,9 @@ class HITLCheckpointRegressionTests(unittest.TestCase):
         self.assertIn("USD 2000", final_response, "Final response must reflect accumulated budget")
         self.assertIn("Looks fantastic!", final_response, "Human feedback must be incorporated")
 
-        # Verify thread cannot be resumed again (no pending interrupt remains)
-        with self.assertRaises(Exception):
-            self.app.invoke(Command(resume={"approved": True}), config=config)
+        # Verify thread is completed and no pending interrupt tasks remain
+        self.assertEqual(snapshot_final.next, (), "Resumed thread must complete to END")
+        self.assertEqual(len(snapshot_final.tasks), 0, "No pending interrupt tasks remain on completed thread")
 
 
 if __name__ == "__main__":
