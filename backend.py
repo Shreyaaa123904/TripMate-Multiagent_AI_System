@@ -24,6 +24,11 @@ from langchain_core.messages import (
 )
 from langchain_groq import ChatGroq
 
+from tools.flight_tool import search_flights
+from tools.tavily_tool import tavily_search
+from trip_extraction import TripExtractionResult, extract_structured_trip
+from trip_state import StructuredTripState, TripOperation, merge_trip_state
+
 
 from mcp_client import (
     tavily_mcp_search,
@@ -66,6 +71,10 @@ llm = ChatGroq(
     max_tokens=MAX_COMPLETION_TOKENS,
 )
 
+
+def get_llm():
+    return llm
+
 # =========================
 # State - original fields kept, new control fields added
 # =========================
@@ -92,6 +101,13 @@ class TravelState(TypedDict, total=False):
     approved: bool
     human_feedback: str
     final_response: str
+
+    # Structured trip state intelligence
+    structured_trip_state: dict[str, Any] | None
+    structured_trip_clarifications: list[str]
+    structured_trip_extraction_error: str
+    structured_trip_provenance: dict[str, str]
+    structured_trip_last_operation: str
 
     llm_calls: int
 
@@ -436,6 +452,50 @@ def _empty_constraints() -> dict[str, Any]:
     }
 
 
+def _constraints_from_structured_state(structured: StructuredTripState | None) -> dict[str, Any]:
+    constraints = _empty_constraints()
+    if not structured:
+        return constraints
+
+    if structured.destination:
+        dest = structured.destination.city or structured.destination.country or structured.destination.raw_text or ""
+        if dest:
+            constraints["destination"] = dest
+
+    if structured.origin:
+        orig = structured.origin.city or structured.origin.country or structured.origin.raw_text or ""
+        if orig:
+            constraints["origin"] = orig
+
+    if structured.dates:
+        if structured.dates.duration_days:
+            constraints["duration"] = f"{structured.dates.duration_days} days"
+        elif structured.dates.departure_date and structured.dates.return_date:
+            constraints["duration"] = f"{structured.dates.departure_date} to {structured.dates.return_date}"
+        elif structured.dates.departure_date:
+            constraints["duration"] = f"From {structured.dates.departure_date}"
+
+    if structured.budget_amount is not None:
+        curr = structured.budget_currency or "$"
+        constraints["budget"] = f"{curr} {structured.budget_amount}"
+
+    if structured.travellers:
+        parts = []
+        if structured.travellers.adults is not None:
+            parts.append(f"{structured.travellers.adults} adult{'s' if structured.travellers.adults != 1 else ''}")
+        if structured.travellers.children is not None:
+            parts.append(f"{structured.travellers.children} child{'ren' if structured.travellers.children != 1 else ''}")
+        if structured.travellers.rooms is not None:
+            parts.append(f"{structured.travellers.rooms} room{'s' if structured.travellers.rooms != 1 else ''}")
+        if parts:
+            constraints["travel_style"] = ", ".join(parts)
+
+    if structured.preferences:
+        constraints["special_preferences"] = list(structured.preferences)
+
+    return constraints
+
+
 # =========================
 # Supervisor Agent + Input Guardrail
 # =========================
@@ -543,10 +603,24 @@ User request:
         if "itinerary_agent" not in selected_agents:
             selected_agents.append("itinerary_agent")
 
-        constraints = _empty_constraints()
+        # Seed base constraints from structured trip state or existing state constraints
+        raw_structured = state.get("structured_trip_state")
+        base_constraints = _empty_constraints()
+        if raw_structured:
+            try:
+                structured_obj = StructuredTripState.model_validate(raw_structured)
+                base_constraints = _constraints_from_structured_state(structured_obj)
+            except Exception:
+                pass
+        if not any(base_constraints.values()):
+            base_constraints = dict(state.get("trip_constraints") or _empty_constraints())
+
+        constraints = base_constraints.copy()
         parsed_constraints = parsed.get("trip_constraints", {})
         if isinstance(parsed_constraints, dict):
-            constraints.update(parsed_constraints)
+            for k, v in parsed_constraints.items():
+                if v:
+                    constraints[k] = v
 
         reasoning = str(parsed.get("reasoning", "")).strip()
         llm_calls += 1
@@ -554,7 +628,7 @@ User request:
         print(f"Supervisor fallback used: {exc}")
         # Original workflow behavior is preserved as the fallback.
         selected_agents = AGENT_ORDER.copy()
-        constraints = _empty_constraints()
+        constraints = dict(state.get("trip_constraints") or _empty_constraints())
         reasoning = (
             "Supervisor parsing failed, so the original full travel workflow "
             "was selected as a safe fallback."
@@ -1046,6 +1120,129 @@ except Exception as exc:
     checkpointer = MemorySaver()
 
 travel_graph = graph.compile(checkpointer=checkpointer)
+_travel_graph = None
+
+
+def get_graph():
+    global _travel_graph, travel_graph
+    if _travel_graph is not None:
+        return _travel_graph
+    return travel_graph
+
+
+def _load_saved_structured_trip_state(graph_instance, config_: dict[str, Any]) -> StructuredTripState | None:
+    """Load the previously checkpointed structured trip state if present."""
+    try:
+        snapshot = graph_instance.get_state(config_)
+    except Exception:
+        return None
+
+    values = getattr(snapshot, "values", {}) or {}
+    raw_state = values.get("structured_trip_state")
+    if not raw_state:
+        return None
+
+    try:
+        return StructuredTripState.model_validate(raw_state)
+    except Exception:
+        return None
+
+
+def _has_mutating_updates(state: StructuredTripState) -> bool:
+    return any(
+        [
+            bool(state.origin),
+            bool(state.destination),
+            bool(state.dates),
+            bool(state.travellers),
+            state.budget_amount is not None,
+            state.budget_currency is not None,
+            state.budget_currency_raw is not None,
+            state.budget_currency_ambiguous,
+            bool(state.preferences),
+            bool(state.remove_fields),
+            bool(state.reset_scope),
+        ]
+    )
+
+
+def _build_structured_provenance(
+    saved_state: StructuredTripState | None,
+    merged_state: StructuredTripState | None,
+    extracted_state: StructuredTripState | None,
+) -> dict[str, str]:
+    fields = [
+        "origin",
+        "destination",
+        "dates",
+        "travellers",
+        "budget_amount",
+        "budget_currency",
+        "budget_currency_raw",
+        "budget_currency_ambiguous",
+        "preferences",
+    ]
+
+    provenance: dict[str, str] = {}
+    for field in fields:
+        extracted_val = getattr(extracted_state, field, None) if extracted_state else None
+        saved_val = getattr(saved_state, field, None) if saved_state else None
+        merged_val = getattr(merged_state, field, None) if merged_state else None
+
+        if extracted_state is None:
+            provenance[field] = "saved"
+        elif extracted_val is None and merged_val == saved_val:
+            provenance[field] = "saved"
+        elif merged_val != saved_val:
+            provenance[field] = "merged"
+        else:
+            provenance[field] = "saved"
+
+    return provenance
+
+
+def _integrate_structured_trip(
+    message: str,
+    saved_state: StructuredTripState | None,
+) -> tuple[StructuredTripState | None, list[str], str | None, dict[str, str], str]:
+    """Extract and safely merge structured trip intelligence for the current message."""
+    extraction: TripExtractionResult = extract_structured_trip(message)
+
+    if extraction.state is None:
+        # Extraction failed: preserve prior structured state and return clarifications.
+        provenance = _build_structured_provenance(saved_state, saved_state, extraction.state)
+        return (
+            saved_state,
+            list(dict.fromkeys(extraction.clarifications)),
+            extraction.extraction_error,
+            provenance,
+            "auto",
+        )
+
+    operation = extraction.state.operation.value
+
+    # Follow-up questions should not mutate state unless explicit updates are present.
+    if extraction.state.operation == TripOperation.FOLLOW_UP and not _has_mutating_updates(extraction.state):
+        provenance = _build_structured_provenance(saved_state, saved_state, extraction.state)
+        return (
+            saved_state,
+            list(dict.fromkeys(extraction.clarifications)),
+            extraction.extraction_error,
+            provenance,
+            operation,
+        )
+
+    merge_outcome = merge_trip_state(saved_state, extraction.state)
+    combined_clarifications = list(dict.fromkeys(extraction.clarifications + merge_outcome.clarifications))
+    provenance = _build_structured_provenance(saved_state, merge_outcome.merged_state, extraction.state)
+
+    return (
+        merge_outcome.merged_state,
+        combined_clarifications,
+        extraction.extraction_error,
+        provenance,
+        operation,
+    )
 
 
 # =========================
@@ -1101,6 +1298,11 @@ def _serialize_result(
         "approved": result.get("approved"),
         "human_feedback": result.get("human_feedback", ""),
         "llm_calls": result.get("llm_calls", 0),
+        "structured_trip_state": result.get("structured_trip_state"),
+        "structured_trip_clarifications": result.get("structured_trip_clarifications", []),
+        "structured_trip_extraction_error": result.get("structured_trip_extraction_error", ""),
+        "structured_trip_provenance": result.get("structured_trip_provenance", {}),
+        "structured_trip_last_operation": result.get("structured_trip_last_operation", ""),
     }
 
 
@@ -1110,15 +1312,27 @@ def run_travel_agent(user_input: str, thread_id: str | None = None):
         thread_id = f"user_{uuid.uuid4().hex}"
 
     config = {"configurable": {"thread_id": thread_id}}
+    graph_to_use = get_graph()
 
-    result = travel_graph.invoke(
+    saved_structured_state = _load_saved_structured_trip_state(graph_to_use, config)
+    (
+        merged_structured_state,
+        structured_clarifications,
+        structured_extraction_error,
+        structured_provenance,
+        structured_operation,
+    ) = _integrate_structured_trip(user_input, saved_structured_state)
+
+    initial_constraints = _constraints_from_structured_state(merged_structured_state)
+
+    result = graph_to_use.invoke(
         {
             "messages": [HumanMessage(content=user_input)],
             "user_query": user_input,
             "guardrail_allowed": True,
             "guardrail_reason": "",
             "selected_agents": [],
-            "trip_constraints": _empty_constraints(),
+            "trip_constraints": initial_constraints,
             "supervisor_reasoning": "",
             "flight_results": "",
             "hotel_results": "",
@@ -1130,6 +1344,15 @@ def run_travel_agent(user_input: str, thread_id: str | None = None):
             "human_feedback": "",
             "final_response": "",
             "llm_calls": 0,
+            "structured_trip_state": (
+                merged_structured_state.model_dump(mode="json")
+                if merged_structured_state is not None
+                else None
+            ),
+            "structured_trip_clarifications": structured_clarifications,
+            "structured_trip_extraction_error": structured_extraction_error or "",
+            "structured_trip_provenance": structured_provenance,
+            "structured_trip_last_operation": structured_operation,
         },
         config=config,
     )
@@ -1147,8 +1370,9 @@ def resume_travel_agent(
         raise ValueError("thread_id is required to resume a travel plan.")
 
     config = {"configurable": {"thread_id": thread_id}}
+    graph_to_use = get_graph()
     try:
-        result = travel_graph.invoke(
+        result = graph_to_use.invoke(
             Command(
                 resume={
                     "approved": approved,
@@ -1164,7 +1388,7 @@ def resume_travel_agent(
         # recover the interrupted state from the checkpointer so we do not lose
         # the pending approval state or return a 500 crash to the user.
         try:
-            checkpoint = travel_graph.get_state(config)
+            checkpoint = graph_to_use.get_state(config)
             if checkpoint and checkpoint.values:
                 state = dict(checkpoint.values)
                 state["approved"] = approved
