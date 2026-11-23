@@ -622,6 +622,20 @@ User request:
                 if v:
                     constraints[k] = v
 
+        # If provenance indicates destination or budget mutated, ensure relevant specialists run
+        provenance = state.get("structured_trip_provenance", {})
+        if provenance.get("destination") == "merged":
+            for agent_name in ["flight_agent", "hotel_agent", "weather_agent"]:
+                if agent_name not in selected_agents:
+                    selected_agents.append(agent_name)
+        if provenance.get("budget_amount") == "merged" or provenance.get("budget_currency") == "merged":
+            if "budget_agent" not in selected_agents:
+                selected_agents.append("budget_agent")
+
+        selected_agents = [name for name in AGENT_ORDER if name in selected_agents]
+        if "itinerary_agent" not in selected_agents:
+            selected_agents.append("itinerary_agent")
+
         reasoning = str(parsed.get("reasoning", "")).strip()
         llm_calls += 1
     except Exception as exc:
@@ -1325,37 +1339,52 @@ def run_travel_agent(user_input: str, thread_id: str | None = None):
 
     initial_constraints = _constraints_from_structured_state(merged_structured_state)
 
-    result = graph_to_use.invoke(
-        {
-            "messages": [HumanMessage(content=user_input)],
-            "user_query": user_input,
-            "guardrail_allowed": True,
-            "guardrail_reason": "",
-            "selected_agents": [],
-            "trip_constraints": initial_constraints,
-            "supervisor_reasoning": "",
+    dest_changed = structured_provenance.get("destination") == "merged"
+    snapshot = graph_to_use.get_state(config)
+    existing_values = getattr(snapshot, "values", {}) or {}
+
+    invoke_payload: dict[str, Any] = {
+        "messages": [HumanMessage(content=user_input)],
+        "user_query": user_input,
+        "guardrail_allowed": True,
+        "guardrail_reason": "",
+        "selected_agents": [],
+        "trip_constraints": initial_constraints,
+        "supervisor_reasoning": "",
+        "approval_request": "",
+        "approved": False,
+        "human_feedback": "",
+        "final_response": "",
+        "llm_calls": 0,
+        "structured_trip_state": (
+            merged_structured_state.model_dump(mode="json")
+            if merged_structured_state is not None
+            else None
+        ),
+        "structured_trip_clarifications": structured_clarifications,
+        "structured_trip_extraction_error": structured_extraction_error or "",
+        "structured_trip_provenance": structured_provenance,
+        "structured_trip_last_operation": structured_operation,
+    }
+
+    if not existing_values:
+        # Initial turn: initialize all specialist and output channels
+        invoke_payload.update({
             "flight_results": "",
             "hotel_results": "",
             "weather_results": "",
             "budget_results": "",
             "itinerary": "",
-            "approval_request": "",
-            "approved": False,
-            "human_feedback": "",
-            "final_response": "",
-            "llm_calls": 0,
-            "structured_trip_state": (
-                merged_structured_state.model_dump(mode="json")
-                if merged_structured_state is not None
-                else None
-            ),
-            "structured_trip_clarifications": structured_clarifications,
-            "structured_trip_extraction_error": structured_extraction_error or "",
-            "structured_trip_provenance": structured_provenance,
-            "structured_trip_last_operation": structured_operation,
-        },
-        config=config,
-    )
+        })
+    elif dest_changed and saved_structured_state and saved_structured_state.destination:
+        # Destination mutated: invalidate previous flight/hotel/weather results so fresh data is fetched
+        invoke_payload.update({
+            "flight_results": "",
+            "hotel_results": "",
+            "weather_results": "",
+        })
+
+    result = graph_to_use.invoke(invoke_payload, config=config)
 
     return _serialize_result(result, thread_id)
 
