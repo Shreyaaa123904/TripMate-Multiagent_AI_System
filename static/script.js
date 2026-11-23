@@ -20,17 +20,31 @@ function setLoading(isLoading, mode = "draft") {
   const btnLoader = document.getElementById("btnLoader");
   const approveBtn = document.getElementById("approveBtn");
   const reviseBtn = document.getElementById("reviseBtn");
+  const approvalRequest = document.getElementById("approvalRequest");
 
   sendBtn.disabled = isLoading;
   approveBtn.disabled = isLoading;
   reviseBtn.disabled = isLoading;
 
-  if (isLoading && mode === "draft") {
-    btnText.classList.add("hidden");
-    btnLoader.classList.remove("hidden");
+  if (isLoading) {
+    if (mode === "draft") {
+      btnText.classList.add("hidden");
+      btnLoader.classList.remove("hidden");
+      if (waitingForApproval && approvalRequest) {
+        approvalRequest.textContent = "Updating draft itinerary with your latest changes...";
+      }
+    } else if (mode === "approval") {
+      approveBtn.textContent = "Processing...";
+      reviseBtn.textContent = "Processing...";
+    }
   } else {
     btnText.classList.remove("hidden");
     btnLoader.classList.add("hidden");
+    approveBtn.textContent = "Approve & Generate Final";
+    reviseBtn.textContent = "Revise Using Feedback";
+    if (btnText) {
+      btnText.textContent = waitingForApproval ? "Update Plan" : "Generate Draft";
+    }
   }
 }
 
@@ -103,6 +117,10 @@ function showResult(answer, threadId, isDraft = false) {
 
 function showApproval(data) {
   waitingForApproval = true;
+  const btnText = document.getElementById("btnText");
+  if (btnText) {
+    btnText.textContent = "Update Plan";
+  }
   const section = document.getElementById("approvalSection");
   const approvalRequest = document.getElementById("approvalRequest");
   approvalRequest.textContent = data.approval_request ||
@@ -112,6 +130,10 @@ function showApproval(data) {
 
 function hideApproval() {
   waitingForApproval = false;
+  const btnText = document.getElementById("btnText");
+  if (btnText) {
+    btnText.textContent = "Generate Draft";
+  }
   document.getElementById("approvalSection").classList.add("hidden");
   document.getElementById("approvalFeedback").value = "";
 }
