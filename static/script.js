@@ -119,8 +119,8 @@ function hideApproval() {
 async function sendMessage() {
   hideError();
 
-  if (waitingForApproval) {
-    showError("Please approve or revise the current draft before starting another plan.");
+  const sendBtn = document.getElementById("sendBtn");
+  if (sendBtn && sendBtn.disabled) {
     return;
   }
 
@@ -154,6 +154,7 @@ async function sendMessage() {
 
     currentThreadId = data.thread_id;
     localStorage.setItem("travel_thread_id", currentThreadId);
+    input.value = "";
 
     showWorkflow(data);
 
