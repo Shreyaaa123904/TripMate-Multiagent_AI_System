@@ -557,6 +557,11 @@ User request:
             "llm_calls": llm_calls,
         }
 
+    accumulated_constraints = state.get("trip_constraints", {})
+    provenance = state.get("structured_trip_provenance", {})
+    changed_fields = [k for k, v in provenance.items() if v == "merged"]
+    changed_desc = ", ".join(changed_fields) if changed_fields else "None"
+
     supervisor_prompt = f"""
 You are the supervisor of a multi-agent travel-planning system.
 Choose only the specialist agents needed for the request.
@@ -567,6 +572,12 @@ Available agents:
 - weather_agent: weather, climate, season, forecast, or packing advice
 - budget_agent: cost, affordability, price limits, or budget feasibility
 - itinerary_agent: creates the integrated travel plan and must always be included
+
+Accumulated Trip Constraints:
+{json.dumps(accumulated_constraints, indent=2)}
+
+Recently Changed Fields:
+{changed_desc}
 
 Return strict JSON only using this schema:
 {{
