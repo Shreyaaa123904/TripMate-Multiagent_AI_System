@@ -599,6 +599,9 @@ function normalizeDestination(rawDest) {
   if (/dubai/i.test(dest) && !/uae|emirates/i.test(dest)) {
     return `${dest}, UAE`;
   }
+  if (/bangkok|phuket|chiang mai|krabi|pattaya|koh samui/i.test(dest) && !/thailand/i.test(dest)) {
+    return `${dest}, Thailand`;
+  }
 
   return dest;
 }
@@ -631,7 +634,7 @@ function parseItineraryLocations(markdownText, data) {
   if (data && data.hotel_results) {
     hotelSources.push(data.hotel_results);
   }
-  const hotelSectionMatch = text.match(/##\s*3\.\s*Hotel Suggestions([\s\S]*?)(?=##\s*\d|\Z)/i);
+  const hotelSectionMatch = text.match(/##\s*3\.\s*Hotel Suggestions([\s\S]*?)(?=##\s*\d|$)/i);
   if (hotelSectionMatch) {
     hotelSources.push(hotelSectionMatch[1]);
   }
@@ -696,7 +699,7 @@ function parseItineraryLocations(markdownText, data) {
   }
 
   // 4. Fallback / supplementary: Parse Day Headings and bullet points if no tables or for extra days
-  const dayRegex = /(?:^|\n)#{1,4}\s*Day\s*(\d+)[:\s–—-]*(.*?)(?=(?:\n#{1,4}\s*Day\s*\d+|\n##\s|\Z))/gis;
+  const dayRegex = /(?:^|\n)#{1,4}\s*Day\s*(\d+)[:\s–—-]*(.*?)(?=(?:\n#{1,4}\s*Day\s*\d+|\n##\s|$))/gis;
   let dayMatch;
 
   while ((dayMatch = dayRegex.exec(text)) !== null) {
@@ -731,7 +734,7 @@ function parseItineraryLocations(markdownText, data) {
 
       // Check action verbs
       const actionMatches = trimmed.matchAll(
-        /(?:visit|explore|discover|tour|head to|walk (?:through|around)|see|stroll (?:around|through)|cross|view from|ascend|stop at|check out)\s+([A-Z0-9][A-Za-z0-9\s'’&.-]{2,45}?)(?=(?:,\s*(?:and\s+)?|\s+and\s+|\s+for\s+|\s+to\s+|\s+in\s+|\s+from\s+|\.|\n|\(|$))/gi
+        /(?:visit|explore|discover|tour|head to|walk (?:through|around)|see|stroll (?:around|through)|cross|view from|ascend|stop at|check out)\s+([A-Z0-9][A-Za-z0-9\s'’&@.-]{2,45}?)(?=(?:,\s*(?:and\s+)?|\s+and\s+|\s+for\s+|\s+to\s+|\s+in\s+|\s+from\s+|\.|\n|\(|$))/gi
       );
       for (const am of actionMatches) {
         const candidate = cleanLandmarkName(am[1]);
@@ -805,15 +808,106 @@ function geocodeLocation(item, destination) {
   });
 }
 
+function buildGeocodeQueries(item, dest) {
+  const cleanDest = (dest && dest !== "Selected Destination") ? dest.trim() : "";
+  const hasArea = Boolean(item.area && item.area !== cleanDest && !isPriceOrNumericNoise(item.area));
+  const queries = [];
+  const seen = new Set();
+
+  const addQuery = (namePart, areaPart = "") => {
+    const n = String(namePart || "").trim();
+    if (!n || n.length < 3 || isPriceOrNumericNoise(n)) return;
+    const parts = [n];
+    if (areaPart && areaPart.toLowerCase() !== cleanDest.toLowerCase()) {
+      parts.push(areaPart);
+    }
+    if (cleanDest && !n.toLowerCase().includes(cleanDest.toLowerCase())) {
+      parts.push(cleanDest);
+    }
+    const q = parts.join(", ");
+    const key = q.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      queries.push(q);
+    }
+  };
+
+  // Tier 1: Name + Area + Destination (or Name + Destination)
+  if (hasArea) {
+    addQuery(item.name, item.area);
+  }
+  // Tier 2: Name + Destination
+  addQuery(item.name);
+
+  // Tier 3: Normalized variants while preserving destination context
+  const baseName = String(item.name || "").trim();
+
+  // 3a. Strip leading descriptor prefixes (e.g., "Restaurant ...", "Hotel ...")
+  const strippedPrefix = baseName.replace(/^(?:café|cafe|club|restaurant|hotel|resort|bar|the)\s+/i, "").trim();
+  if (strippedPrefix.length >= 3 && strippedPrefix.toLowerCase() !== baseName.toLowerCase()) {
+    if (hasArea) addQuery(strippedPrefix, item.area);
+    addQuery(strippedPrefix);
+  }
+
+  // 3b. Try prepending "The " when omitted (e.g., "Deck by Arun Residence" -> "The Deck by Arun Residence")
+  if (!/^the\s+/i.test(baseName)) {
+    addQuery(`The ${baseName}`);
+  }
+
+  // 3c. Handle "@..." venue suffixes (e.g., "Kan Eang@Pier" -> "Kan Eang", "Kan Eang Pier")
+  if (baseName.includes("@")) {
+    const withoutAtSuffix = baseName.replace(/\s*@.*$/, "").trim();
+    const spaceSeparated = baseName.replace(/\s*@\s*/g, " ").trim();
+    addQuery(withoutAtSuffix);
+    addQuery(spaceSeparated);
+  }
+
+  // 3d. Handle "<Venue> by <Parent>" names (e.g., "Deck by Arun Residence" -> "Arun Residence", "The Deck")
+  const byMatch = baseName.match(/^(.+?)\s+by\s+(.+)$/i);
+  if (byMatch) {
+    const parentVenue = byMatch[2].trim();
+    const childVenue = byMatch[1].trim();
+    addQuery(parentVenue);
+    addQuery(childVenue);
+    if (!/^the\s+/i.test(childVenue)) {
+      addQuery(`The ${childVenue}`);
+    }
+  }
+
+  // 3e. Strip trailing English generic type words when local name alone is indexed (e.g., "Suan Rot Fai Park" -> "Suan Rot Fai")
+  const strippedSuffix = baseName.replace(/\s+(?:park|market|garden|gardens|pier)$/i, "").trim();
+  if (strippedSuffix.length >= 4 && strippedSuffix.toLowerCase() !== baseName.toLowerCase()) {
+    addQuery(strippedSuffix);
+  }
+
+  return queries;
+}
+
 async function fetchNominatimQuery(query) {
   const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1`;
-  const response = await fetch(url, {
-    headers: { "Accept": "application/json" }
-  });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
+  const attempt = async () => {
+    const response = await fetch(url, {
+      headers: { "Accept": "application/json" }
+    });
+    if (response.status === 429 || response.status === 503) {
+      return { retry: true, status: response.status };
+    }
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return { retry: false, data: await response.json() };
+  };
+
+  let res = await attempt();
+  if (res.retry) {
+    await new Promise((r) => setTimeout(r, 2000));
+    lastGeocodeTimestamp = Date.now();
+    res = await attempt();
+    if (res.retry) {
+      throw new Error(`HTTP ${res.status}`);
+    }
   }
-  return await response.json();
+  return res.data;
 }
 
 async function triggerGeocodeQueue() {
@@ -825,39 +919,20 @@ async function triggerGeocodeQueue() {
     const item = task.item;
     const dest = task.destination;
 
-    const now = Date.now();
-    const elapsed = now - lastGeocodeTimestamp;
-    if (elapsed < NOMINATIM_MIN_INTERVAL_MS) {
-      await new Promise((r) => setTimeout(r, NOMINATIM_MIN_INTERVAL_MS - elapsed));
-    }
-
     try {
-      lastGeocodeTimestamp = Date.now();
+      const queries = buildGeocodeQueries(item, dest);
+      let results = [];
 
-      // Tier 1: Name + Area + Destination
-      const q1 = (item.area && item.area !== dest)
-        ? `${item.name}, ${item.area}, ${dest}`
-        : `${item.name}, ${dest}`;
-
-      let results = await fetchNominatimQuery(q1);
-
-      // Tier 2: If area was included and failed, try Name + Destination
-      if ((!results || results.length === 0) && item.area) {
-        await new Promise((r) => setTimeout(r, NOMINATIM_MIN_INTERVAL_MS));
+      for (let idx = 0; idx < queries.length; idx++) {
+        const now = Date.now();
+        const elapsed = now - lastGeocodeTimestamp;
+        if (elapsed < NOMINATIM_MIN_INTERVAL_MS) {
+          await new Promise((r) => setTimeout(r, NOMINATIM_MIN_INTERVAL_MS - elapsed));
+        }
         lastGeocodeTimestamp = Date.now();
-        results = await fetchNominatimQuery(`${item.name}, ${dest}`);
-      }
-
-      // Tier 3: If descriptor prefix like Café / Cafe / Club / Restaurant exists, try stripped name
-      if (!results || results.length === 0) {
-        const stripped = item.name.replace(/^(?:café|cafe|club|restaurant|hotel)\s+/i, "").trim();
-        if (stripped.length >= 3 && stripped.toLowerCase() !== item.name.toLowerCase()) {
-          await new Promise((r) => setTimeout(r, NOMINATIM_MIN_INTERVAL_MS));
-          lastGeocodeTimestamp = Date.now();
-          const q3 = (item.area && item.area !== dest)
-            ? `${stripped}, ${item.area}, ${dest}`
-            : `${stripped}, ${dest}`;
-          results = await fetchNominatimQuery(q3);
+        results = await fetchNominatimQuery(queries[idx]);
+        if (Array.isArray(results) && results.length > 0) {
+          break;
         }
       }
 
