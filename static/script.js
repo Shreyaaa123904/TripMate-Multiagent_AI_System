@@ -336,7 +336,7 @@ let geocodeQueue = [];
 let isGeocodingQueueRunning = false;
 let lastGeocodeTimestamp = 0;
 const memoryGeoCache = new Map();
-const GEO_CACHE_PREFIX = "tripmate_geo_";
+const GEO_CACHE_PREFIX = "tripmate_geo_v2_";
 const NOMINATIM_MIN_INTERVAL_MS = 1100;
 
 function escapeHtml(str) {
@@ -369,14 +369,73 @@ const GENERIC_LANDMARK_EXCLUSIONS = new Set([
   "iconic highlights", "culture", "arrival", "exploration", "free time", "leisure",
   "sightseeing", "flight", "flights", "standard stay", "scenic drive", "coastal drive",
   "beach hopping", "transfer", "back to hotel", "return to hotel", "breakfast at hotel",
-  "dinner at hotel", "lunch at hotel", "relax at hotel"
+  "dinner at hotel", "lunch at hotel", "relax at hotel",
+  "activities", "transit", "accommodation", "accommodations", "transport", "transportation",
+  "food", "dining", "shopping", "meals", "lunch", "dinner", "breakfast", "snacks",
+  "overview", "trip summary", "estimated budget", "budget summary", "final recommendations",
+  "practical tips", "notes", "note", "tips"
 ]);
+
+function normalizeUnicodeSpaces(str) {
+  return String(str || "").replace(/[\u00a0\u202f\u2007\u2009\u200a]/g, " ");
+}
+
+function isPriceOrNumericNoise(text) {
+  if (!text) return true;
+  const raw = normalizeUnicodeSpaces(text).trim();
+  if (!raw) return true;
+
+  // Reject any currency symbol
+  if (/[₹$€£¥฿₩₫₱₺₽₦₴₭₮]/.test(raw)) {
+    return true;
+  }
+
+  // Reject currency codes and currency words
+  if (/\b(?:inr|usd|eur|gbp|jpy|thb|aed|sgd|myr|bdt|idr|vnd|krw|aud|cad|chf|cny|rmb|hkd|nzd|qar|sar|omr|kwd|rupees?|baht|yen|dollars?|euros?|pounds?|dirhams?|taka|lakhs?|crores?)\b/i.test(raw)) {
+    return true;
+  }
+  if (/(?:\brs\.?\s*\d|\d\s*rs\.?\b|^rs\.?$)/i.test(raw)) {
+    return true;
+  }
+
+  // Reject price/budget/cost/duration phrases
+  if (/\b(?:cost|costs|price|prices|pricing|budget|budgets|fare|fares|airfare|fee|fees|ticket|tickets|expense|expenses|subtotal|total|allocation|feasibility|estimate|estimated|approx\.?|per\s+(?:night|person|pax|day|head|couple|room)|hours?|hrs?|mins?|minutes?)\b/i.test(raw)) {
+    return true;
+  }
+  if (/\bday\s*\d+\b|\b\d+\s*days?\b|\b\d+\s*nights?\b/i.test(raw)) {
+    return true;
+  }
+
+  // Reject numeric/price ranges (e.g., "500-800", "1,500 – 2,500", "10 to 20") and k-shorthand ("50k")
+  if (/\b\d[\d,]*(?:\.\d+)?\s*(?:[-–—]|to)\s*\d[\d,]*(?:\.\d+)?\b/i.test(raw)) {
+    return true;
+  }
+  if (/\b\d[\d,]*(?:\.\d+)?\s*k\b/i.test(raw)) {
+    return true;
+  }
+
+  // Reject strings that are primarily numerical or lack meaningful alphabetic words
+  const letters = (raw.match(/[A-Za-z]/g) || []).length;
+  const digits = (raw.match(/\d/g) || []).length;
+  if (letters < 3) {
+    return true;
+  }
+  if (digits > 0 && digits >= letters) {
+    return true;
+  }
+  if (/^\s*~?\d[\d,.]*\s*[A-Za-z]{0,4}\s*$/.test(raw)) {
+    return true;
+  }
+
+  return false;
+}
 
 function isGenericNoise(text) {
   if (!text) return true;
-  const low = String(text).trim().toLowerCase();
+  const low = normalizeUnicodeSpaces(text).trim().toLowerCase();
   if (low.length < 3) return true;
   if (GENERIC_LANDMARK_EXCLUSIONS.has(low)) return true;
+  if (isPriceOrNumericNoise(text)) return true;
 
   const genericPatterns = [
     "breakfast at hotel", "return to hotel", "back to hotel", "check in at hotel",
@@ -390,8 +449,14 @@ function isGenericNoise(text) {
 
 function cleanLandmarkName(raw) {
   if (!raw) return null;
-  let text = String(raw).trim();
-  text = text.replace(/^(the|a|an)\s+/i, "");
+  const rawStr = normalizeUnicodeSpaces(raw).trim();
+  if (isPriceOrNumericNoise(rawStr)) return null;
+
+  let text = rawStr;
+  // Strip lowercase articles from action phrases (e.g., "the Grand Palace"),
+  // while preserving capitalized proper names like "The Deck by Arun Residence".
+  text = text.replace(/^(?:a|an)\s+/i, "");
+  text = text.replace(/^the\s+/, "");
   text = text.replace(/^[*_~`#\s•–—-]+|[*_~`#\s•–—-]+$/g, "");
   text = text.replace(/[.,;:'"()\[\]{}]+$/g, "").trim();
 
@@ -464,11 +529,15 @@ function splitLocationsFromActivity(rawActivity, locationDetails = "") {
     let area = "";
 
     // Check parenthetical area like "Fisherman's Wharf (Calangute)" or "Thalassa (Baga)"
+    // Ignore parenthetical price/cost/time notes (e.g., "Wat Pho (Entry ~300 THB)")
     const parenMatch = chunk.match(/^(.*?)\s*\(([^)]+)\)\s*$/);
     if (parenMatch) {
       cleanName = parenMatch[1].trim();
-      area = parenMatch[2].trim();
-    } else if (locationDetails && !isGenericNoise(locationDetails)) {
+      const parenArea = parenMatch[2].trim();
+      if (parenArea && !isGenericNoise(parenArea) && !isPriceOrNumericNoise(parenArea)) {
+        area = parenArea;
+      }
+    } else if (locationDetails && !isGenericNoise(locationDetails) && !isPriceOrNumericNoise(locationDetails)) {
       area = String(locationDetails).trim();
     }
 
@@ -520,13 +589,13 @@ function parseMarkdownTables(text) {
       const isSeparator = /^\|(?:\s*:?-+:?\s*\|)+$/.test(nextLine);
 
       if (isSeparator) {
-        inTable = true;
         headerCells = cells;
         actCol = -1;
         locCol = -1;
         dayCol = -1;
         timeCol = -1;
 
+        let hasCostHeader = false;
         headerCells.forEach((h, idx) => {
           const hLow = h.toLowerCase();
           if (/activity|attraction|sight|place|plan|schedule|itinerary/i.test(hLow)) {
@@ -537,8 +606,19 @@ function parseMarkdownTables(text) {
             dayCol = idx;
           } else if (/time/i.test(hLow)) {
             timeCol = idx;
+          } else if (/cost|price|budget|expense|fare|amount|fee|rate/i.test(hLow)) {
+            hasCostHeader = true;
           }
         });
+
+        // Skip non-itinerary cost/budget breakdown tables
+        if (hasCostHeader && actCol === -1 && dayCol === -1 && timeCol === -1) {
+          inTable = false;
+          i++; // skip separator line
+          continue;
+        }
+
+        inTable = true;
 
         if (actCol === -1) {
           if (headerCells.length >= 3) actCol = (dayCol === 0 || timeCol === 0) ? 1 : 2;
