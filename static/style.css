@@ -54,7 +54,7 @@ body {
 }
 
 .app-container {
-  width: min(1120px, calc(100% - 32px));
+  width: min(1360px, calc(100% - 32px));
   margin: 0 auto;
   padding: 56px 0 30px;
 }
@@ -538,6 +538,353 @@ footer {
   }
 }
 
+/* ==========================================================================
+   Map Visualization & Split-Screen Layout
+   ========================================================================== */
+
+/* Day Filter Bar */
+.day-filter-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 22px;
+  padding: 12px 18px;
+  background: rgba(30, 41, 59, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 16px;
+}
+
+.filter-label {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.day-filter-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.day-pill {
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(51, 65, 85, 0.65);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  color: #e2e8f0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.day-pill:hover {
+  background: rgba(71, 85, 105, 0.95);
+  border-color: #60a5fa;
+  color: #ffffff;
+}
+
+.day-pill.active {
+  background: linear-gradient(135deg, #2563eb, #3b82f6);
+  border-color: #60a5fa;
+  color: #ffffff;
+  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.45);
+}
+
+/* Split-Screen Container */
+.split-view-container {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+  gap: 24px;
+  align-items: start;
+}
+
+.itinerary-panel {
+  min-width: 0;
+}
+
+/* Interactive Map Panel */
+.map-panel {
+  min-width: 0;
+  background: rgba(15, 23, 42, 0.88);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 22px;
+  padding: 20px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+  position: sticky;
+  top: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.map-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.map-header-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.map-header-title h3 {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: #f1f5f9;
+  margin: 0;
+}
+
+.map-legend {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.legend-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #cbd5e1;
+}
+
+.legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.legend-attraction .legend-dot {
+  background: #10b981;
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.6);
+}
+
+.legend-restaurant .legend-dot {
+  background: #f59e0b;
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.6);
+}
+
+.legend-market .legend-dot {
+  background: #a855f7;
+  box-shadow: 0 0 8px rgba(168, 85, 247, 0.6);
+}
+
+.legend-hotel .legend-dot {
+  background: #3b82f6;
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.6);
+}
+
+.map-container {
+  width: 100%;
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: #0f172a;
+  position: relative;
+}
+
+#tripMap {
+  width: 100%;
+  height: 520px;
+  background: #0f172a;
+}
+
+/* Custom Map Markers & Popups */
+.map-marker-pin {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  font-size: 15px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+  border: 2px solid #ffffff;
+  cursor: pointer;
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+
+.map-marker-pin.marker-hotel {
+  background: linear-gradient(135deg, #1d4ed8, #3b82f6);
+  color: #ffffff;
+}
+
+.map-marker-pin.marker-restaurant {
+  background: linear-gradient(135deg, #d97706, #f59e0b);
+  color: #ffffff;
+}
+
+.map-marker-pin.marker-market {
+  background: linear-gradient(135deg, #7c3aed, #a855f7);
+  color: #ffffff;
+}
+
+.map-marker-pin.marker-attraction {
+  background: linear-gradient(135deg, #059669, #10b981);
+  color: #ffffff;
+}
+
+.map-marker-pin.marker-inactive {
+  opacity: 0.28;
+  transform: scale(0.85);
+  filter: grayscale(70%);
+}
+
+.map-marker-pin.marker-highlighted {
+  transform: scale(1.25);
+  border-color: #fef08a;
+  box-shadow: 0 0 18px rgba(234, 179, 8, 0.95);
+  z-index: 9999 !important;
+}
+
+/* Leaflet Popup Styling */
+.leaflet-popup-content-wrapper {
+  background: #1e293b;
+  color: #f8fafc;
+  border-radius: 14px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.55);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  padding: 4px;
+}
+
+.leaflet-popup-tip {
+  background: #1e293b;
+}
+
+.leaflet-container a.leaflet-popup-close-button {
+  color: #94a3b8;
+  padding: 8px;
+}
+
+.leaflet-container a.leaflet-popup-close-button:hover {
+  color: #ffffff;
+}
+
+.map-popup-card {
+  padding: 8px 6px 6px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 260px;
+}
+
+.popup-tag {
+  display: inline-block;
+  align-self: flex-start;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.popup-tag.tag-hotel {
+  background: rgba(59, 130, 246, 0.25);
+  color: #93c5fd;
+  border: 1px solid rgba(59, 130, 246, 0.4);
+}
+
+.popup-tag.tag-restaurant {
+  background: rgba(245, 158, 11, 0.25);
+  color: #fde68a;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+}
+
+.popup-tag.tag-market {
+  background: rgba(168, 85, 247, 0.25);
+  color: #e9d5ff;
+  border: 1px solid rgba(168, 85, 247, 0.45);
+}
+
+.popup-tag.tag-attraction {
+  background: rgba(16, 185, 129, 0.25);
+  color: #6ee7b7;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+}
+
+.popup-name {
+  font-size: 0.98rem;
+  font-weight: 700;
+  color: #f8fafc;
+  line-height: 1.3;
+}
+
+.popup-snippet {
+  font-size: 0.82rem;
+  color: #cbd5e1;
+  line-height: 1.4;
+}
+
+/* Map Status & Unmapped Locations */
+.map-status {
+  font-size: 0.84rem;
+  color: #94a3b8;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(30, 41, 59, 0.55);
+  border: 1px solid rgba(148, 163, 184, 0.15);
+}
+
+.unmapped-box {
+  background: rgba(245, 158, 11, 0.09);
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  border-radius: 12px;
+  padding: 12px 14px;
+  font-size: 0.82rem;
+}
+
+.unmapped-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #fcd34d;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.unmapped-list {
+  margin: 0;
+  padding-left: 18px;
+  color: #cbd5e1;
+}
+
+.unmapped-list li {
+  margin-bottom: 4px;
+  line-height: 1.45;
+}
+
+.unmapped-list li strong {
+  color: #fde68a;
+}
+
+@media (max-width: 992px) {
+  .split-view-container {
+    grid-template-columns: 1fr;
+  }
+
+  .map-panel {
+    position: static;
+  }
+
+  #tripMap {
+    height: 380px;
+  }
+}
+
 @media print {
   body {
     background: #ffffff;
@@ -547,10 +894,13 @@ footer {
   .workflow-section,
   .approval-section,
   .hero-section,
+  .map-panel,
+  .day-filter-bar,
+  #dayFilterBar,
   footer,
   .result-actions,
   #threadInfo {
-    display: none;
+    display: none !important;
   }
 
   .result-section {

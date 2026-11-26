@@ -7,7 +7,9 @@ os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
 from typing import Any, TypedDict, Annotated
+from datetime import date
 import operator
+import re
 import uuid
 import asyncio
 import json
@@ -69,6 +71,7 @@ llm = ChatGroq(
     model="openai/gpt-oss-120b",
     api_key=GROQ_API_KEY,
     max_tokens=MAX_COMPLETION_TOKENS,
+    reasoning_effort="low",
 )
 
 
@@ -278,11 +281,57 @@ def _is_rate_limit_or_token_error(exc: Exception) -> bool:
     return any(ind in msg for ind in indicators)
 
 
+def _compress_prompt_preserving_structure(prompt: str, max_chars: int) -> str:
+    """Reduce prompt size on retry while keeping Markdown line breaks and tail instructions."""
+    if not prompt or len(prompt) <= max_chars:
+        return prompt
+
+    lines = [line.rstrip() for line in prompt.splitlines()]
+    compacted_lines: list[str] = []
+    prev_blank = False
+    for line in lines:
+        is_blank = not line.strip()
+        if is_blank and prev_blank:
+            continue
+        compacted_lines.append(line)
+        prev_blank = is_blank
+
+    compacted = "\n".join(compacted_lines).strip()
+    if len(compacted) <= max_chars:
+        return compacted
+
+    # Preserve leading context (first ~30%) and trailing instructions/itinerary (last ~65%)
+    head_budget = max(200, int(max_chars * 0.30))
+    tail_budget = max(300, max_chars - head_budget - 10)
+
+    head_parts: list[str] = []
+    head_len = 0
+    for line in compacted_lines:
+        add_len = len(line) + 1
+        if head_len + add_len > head_budget and head_parts:
+            break
+        head_parts.append(line)
+        head_len += add_len
+
+    tail_parts: list[str] = []
+    tail_len = 0
+    for line in reversed(compacted_lines):
+        add_len = len(line) + 1
+        if tail_len + add_len > tail_budget and tail_parts:
+            break
+        tail_parts.append(line)
+        tail_len += add_len
+    tail_parts.reverse()
+
+    return "\n".join(head_parts) + "\n...\n" + "\n".join(tail_parts)
+
+
 def _safe_llm_invoke(
     system_prompt: str,
     user_prompt: str,
     fallback_fn=None,
     max_tokens: int | None = None,
+    retry_user_prompt: str | None = None,
 ) -> tuple[str, bool]:
     """
     Safely invoke the LLM with error handling for token limits and rate limits.
@@ -306,12 +355,19 @@ def _safe_llm_invoke(
         if _is_rate_limit_or_token_error(exc):
             try:
                 print("Attempting compressed retry under reduced token constraints...")
-                compressed_prompt = _summarize_text(user_prompt, max_chars=len(user_prompt) // 2)
+                compressed_prompt = (
+                    retry_user_prompt
+                    if retry_user_prompt is not None
+                    else _compress_prompt_preserving_structure(
+                        user_prompt, max_chars=max(1200, int(len(user_prompt) * 0.65))
+                    )
+                )
                 retry_messages = [
                     SystemMessage(content=system_prompt),
                     HumanMessage(content=compressed_prompt),
                 ]
-                invoker = llm.bind(max_tokens=min(max_tokens or 1024, 1024))
+                retry_max_tokens = min(max_tokens or MAX_COMPLETION_TOKENS, MAX_COMPLETION_TOKENS)
+                invoker = llm.bind(max_tokens=retry_max_tokens)
                 response = invoker.invoke(retry_messages)
                 return str(response.content), False
             except Exception as retry_exc:
@@ -328,6 +384,50 @@ def _safe_llm_invoke(
             "Please verify your travel details and try again.",
             True,
         )
+
+
+def _extract_requested_days(state: TravelState) -> int | None:
+    """Extract the requested number of trip days from structured state, constraints, or query."""
+    structured = state.get("structured_trip_state") or {}
+    if isinstance(structured, dict):
+        dates = structured.get("dates") or {}
+        if isinstance(dates, dict):
+            duration_days = dates.get("duration_days")
+            if isinstance(duration_days, int) and duration_days > 0:
+                return duration_days
+            dep_raw = dates.get("departure_date")
+            ret_raw = dates.get("return_date")
+            if dep_raw and ret_raw:
+                try:
+                    dep_d = date.fromisoformat(str(dep_raw))
+                    ret_d = date.fromisoformat(str(ret_raw))
+                    if ret_d >= dep_d:
+                        return (ret_d - dep_d).days + 1
+                except ValueError:
+                    pass
+
+    constraints = state.get("trip_constraints") or {}
+    duration_str = str(constraints.get("duration") or "").strip()
+    if duration_str:
+        match = re.search(r"\b(\d+)\s*[-]?\s*days?\b", duration_str, re.IGNORECASE)
+        if match:
+            val = int(match.group(1))
+            if val > 0:
+                return val
+        bare_match = re.fullmatch(r"\d+", duration_str)
+        if bare_match:
+            val = int(duration_str)
+            if val > 0:
+                return val
+
+    query = str(state.get("user_query") or "")
+    q_match = re.search(r"\b(\d+)\s*[-]?\s*days?\b", query, re.IGNORECASE)
+    if q_match:
+        val = int(q_match.group(1))
+        if val > 0:
+            return val
+
+    return None
 
 
 def _synthesize_budget_results(state: TravelState) -> str:
@@ -348,27 +448,106 @@ def _synthesize_draft_itinerary(state: TravelState) -> str:
     query = state.get("user_query", "")
     constraints = state.get("trip_constraints", {})
     dest = constraints.get("destination") or "your destination"
-    duration = constraints.get("duration") or "a multi-day stay"
+    requested_days = _extract_requested_days(state)
+    num_days = max(1, min(requested_days or 3, 30))
+    duration = constraints.get("duration") or f"{num_days} days"
+
+    middle_themes = [
+        (
+            "Iconic Landmarks & Heritage",
+            "Visit top historic landmarks and architectural highlights in {dest}.",
+            "Explore bustling local markets and scenic viewpoints.",
+            "Enjoy traditional regional cuisine at a well-rated neighborhood restaurant.",
+        ),
+        (
+            "Cultural Districts & Museums",
+            "Tour major museums, galleries, or heritage quarters in {dest}.",
+            "Walk through artisan streets and sample local street food or cafes.",
+            "Experience evening cultural entertainment or a waterfront stroll.",
+        ),
+        (
+            "Nature, Parks & Scenic Exploration",
+            "Head out early to a prominent park, garden, or coastal/scenic area near {dest}.",
+            "Relax over lunch and visit a panoramic lookout or botanical spot.",
+            "Unwind with dinner in a lively local dining district.",
+        ),
+        (
+            "Local Neighborhoods & Culinary Trail",
+            "Discover a charming residential neighborhood and morning bakery/coffee spots.",
+            "Join a self-guided food and market tasting route across central {dest}.",
+            "Enjoy sunset views followed by casual local dining.",
+        ),
+        (
+            "Day Excursion & Regional Highlights",
+            "Take a half-day or full-day excursion to a nearby attraction outside central {dest}.",
+            "Explore local sights, crafts, and lunch spots before returning.",
+            "Evening at leisure near your hotel with relaxed dinner.",
+        ),
+        (
+            "Hidden Gems & Leisure",
+            "Visit lesser-known temples, shrines, historic alleys, or independent shops.",
+            "Enjoy a leisurely lunch and flexible time for personal interests.",
+            "Sunset promenade walk and dinner at a popular local spot.",
+        ),
+    ]
+
+    day_blocks: list[str] = []
+    if num_days == 1:
+        day_blocks.append(
+            f"""### Day 1: Essential Highlights of {dest}
+- **Morning:** Arrive in {dest}, store luggage or check in, and explore top central landmarks.
+- **Afternoon:** Visit key cultural sights, local markets, and enjoy regional lunch.
+- **Evening:** Sunset viewpoint walk and farewell dinner before departure."""
+        )
+    else:
+        day_blocks.append(
+            f"""### Day 1: Arrival & Orientation in {dest}
+- **Morning:** Arrive in {dest}, transfer to your accommodation, and drop bags or check in.
+- **Afternoon:** Take a light orientation walk through the central district and grab a local lunch.
+- **Evening:** Enjoy an early dinner featuring regional specialties and rest up."""
+        )
+
+        for day_idx in range(2, num_days):
+            title, morn, aft, eve = middle_themes[(day_idx - 2) % len(middle_themes)]
+            day_blocks.append(
+                f"""### Day {day_idx}: {title}
+- **Morning:** {morn.format(dest=dest)}
+- **Afternoon:** {aft.format(dest=dest)}
+- **Evening:** {eve.format(dest=dest)}"""
+            )
+
+        day_blocks.append(
+            f"""### Day {num_days}: Final Exploration & Departure
+- **Morning:** Relaxed breakfast, neighborhood café visit, and any missed nearby sights in {dest}.
+- **Afternoon:** Last-minute souvenir shopping, lunch, and hotel check-out/packing.
+- **Evening:** Farewell meal (time permitting) and airport/station transfer for departure."""
+        )
+
+    days_markdown = "\n\n".join(day_blocks)
     return f"""# Draft Itinerary: {dest} ({duration})
 
 ## Overview
 Trip plan for: {query}
 
-### Day 1: Arrival & Exploration
-- Morning/Afternoon: Arrive at {dest}, transfer to hotel, check in and freshen up.
-- Evening: Take a relaxed orientation stroll around the central neighborhood and enjoy local dining.
-
-### Day 2: Iconic Highlights & Culture
-- Morning: Visit top historic landmarks and cultural sights.
-- Afternoon: Explore local markets and iconic viewpoints.
-- Evening: Traditional dinner and evening leisure.
-
-### Day 3: Local Experiences & Departure Prep
-- Morning: Discover hidden gems, neighborhood cafes, and scenic walks.
-- Afternoon: Leisurely souvenir shopping and relaxing activity.
-- Evening: Farewell dinner celebrating your stay.
+{days_markdown}
 
 *This draft itinerary is ready for your review and approval.*"""
+
+
+def _clean_itinerary_for_final(itinerary_text: str) -> str:
+    """Strip redundant draft wrapper title/footer while preserving all days and content."""
+    if not itinerary_text:
+        return ""
+    lines = itinerary_text.strip().splitlines()
+    if lines and re.match(r"^#\s*Draft Itinerary\b", lines[0].strip(), re.IGNORECASE):
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+    if lines and lines[-1].strip().lower() == "*this draft itinerary is ready for your review and approval.*":
+        lines = lines[:-1]
+        while lines and not lines[-1].strip():
+            lines = lines[:-1]
+    return "\n".join(lines).strip()
 
 
 def _synthesize_final_response(state: TravelState) -> str:
@@ -386,9 +565,10 @@ def _synthesize_final_response(state: TravelState) -> str:
     elif approved:
         review_note = "\n*Note: Travel plan finalized based on your approved draft itinerary.*\n"
 
-    itinerary_text = state.get("itinerary", "")
-    if not itinerary_text:
-        itinerary_text = _synthesize_draft_itinerary(state)
+    raw_itinerary = state.get("itinerary", "")
+    if not raw_itinerary:
+        raw_itinerary = _synthesize_draft_itinerary(state)
+    itinerary_text = _clean_itinerary_for_final(raw_itinerary)
 
     flight_text = state.get("flight_results") or "Flight options available upon departure booking confirmation."
     hotel_text = state.get("hotel_results") or "Recommended central hotels with good transit access."
@@ -887,12 +1067,34 @@ If exact live prices are unavailable, clearly label estimates as approximate.
 # Itinerary Agent - context optimized & safe fallback
 # =========================
 def itinerary_agent(state: TravelState):
-    flight_summary = _summarize_text(state.get("flight_results", ""), max_chars=400)
-    hotel_summary = _summarize_text(state.get("hotel_results", ""), max_chars=400)
+    flight_summary = _summarize_text(state.get("flight_results", ""), max_chars=500)
+    hotel_summary = _summarize_text(state.get("hotel_results", ""), max_chars=800)
     weather_summary = _summarize_text(state.get("weather_results", ""), max_chars=250)
-    budget_summary = _summarize_text(state.get("budget_results", ""), max_chars=350)
+    budget_summary = _summarize_text(state.get("budget_results", ""), max_chars=450)
 
-    prompt = f"""Create a structured draft travel itinerary.
+    requested_days = _extract_requested_days(state)
+    if requested_days:
+        day_requirement = (
+            f"CRITICAL REQUIREMENT: Generate the COMPLETE {requested_days}-day itinerary "
+            f"covering EVERY day from ### Day 1 through ### Day {requested_days} in sequential order. "
+            "Every single day must have meaningful Morning, Afternoon, and Evening activities—never omit later days "
+            "and never output bare headings without activities."
+        )
+    else:
+        day_requirement = (
+            "CRITICAL REQUIREMENT: Cover EVERY requested day sequentially from Day 1 to the final day, "
+            "with meaningful Morning, Afternoon, and Evening activities for every single day."
+        )
+
+    format_rules = (
+        f"Instructions:\n"
+        f"- {day_requirement}\n"
+        "- Use Markdown headings (`### Day 1: <Short Theme>`, `### Day 2: <Short Theme>`, etc.) with 3 concise bullet points per day (`- **Morning:** ...`, `- **Afternoon:** ...`, `- **Evening:** ...`).\n"
+        "- Include specific landmarks, neighborhoods, local dining/markets, and brief practical/transit notes in each bullet (1-2 crisp sentences per bullet, no redundant filler) so all requested days fit cleanly within the response budget.\n"
+        "- Keep the plan practical, budget-aware, and aligned with user constraints and hotel/flight/weather context."
+    )
+
+    prompt = f"""Create a complete, structured draft travel itinerary.
 
 User Query:
 {state['user_query']}
@@ -912,17 +1114,30 @@ Weather Outlook:
 Budget Analysis:
 {budget_summary}
 
-Instructions:
-- Provide a clear day-by-day plan with morning, afternoon, and evening activities.
-- Keep the plan practical, budget-aware, and aligned with user constraints.
-- Create a well-structured draft ready for traveler review and approval.
+{format_rules}
+"""
+
+    retry_prompt = f"""Create a complete, structured draft travel itinerary.
+
+User Query: {state['user_query']}
+Trip Constraints: {state.get('trip_constraints', {})}
+Flights: {_summarize_text(state.get('flight_results', ''), max_chars=200)}
+Hotels: {_summarize_text(state.get('hotel_results', ''), max_chars=300)}
+Weather: {_summarize_text(state.get('weather_results', ''), max_chars=150)}
+Budget: {_summarize_text(state.get('budget_results', ''), max_chars=200)}
+
+{format_rules}
 """
 
     content, _ = _safe_llm_invoke(
-        system_prompt="You are an expert travel planner. Create realistic, structured draft itineraries.",
+        system_prompt=(
+            "You are an expert travel planner. Create realistic, concise, complete day-by-day "
+            "draft itineraries that cover every requested day with concrete activities."
+        ),
         user_prompt=prompt,
         fallback_fn=lambda: _synthesize_draft_itinerary(state),
-        max_tokens=1500,
+        max_tokens=MAX_COMPLETION_TOKENS,
+        retry_user_prompt=retry_prompt,
     )
 
     approval_request = (
@@ -974,28 +1189,44 @@ def final_agent(state: TravelState):
     approved = state.get("approved", False)
     feedback = state.get("human_feedback", "").strip()
 
+    # Approved drafts are already complete: assemble the 7-section plan deterministically
+    # without an unnecessary LLM rewrite that could truncate days or drop specialist details.
     if approved:
-        review_instruction = (
-            "The user approved the draft itinerary. Preserve its schedule, activities, and decisions "
-            "while polishing the final presentation."
-        )
-    else:
-        review_instruction = (
-            f"The user requested revisions with this feedback: '{feedback}'. "
-            "Incorporate these changes into the schedule and finalize the plan."
-        )
+        content = _synthesize_final_response(state)
+        response = AIMessage(content=content)
+        return {
+            "final_response": content,
+            "messages": [response],
+            "llm_calls": state.get("llm_calls", 0),
+        }
 
-    # Use concise highlights instead of full duplicate raw dumps
-    flight_summary = _summarize_text(state.get("flight_results", ""), max_chars=400)
-    hotel_summary = _summarize_text(state.get("hotel_results", ""), max_chars=400)
-    weather_summary = _summarize_text(state.get("weather_results", ""), max_chars=250)
-    budget_summary = _summarize_text(state.get("budget_results", ""), max_chars=400)
-    draft_itinerary = _summarize_text(state.get("itinerary", ""), max_chars=3000)
+    # Revision path: preserve the complete draft itinerary (never truncate to 3,000 chars)
+    # and ask the LLM to output ONLY the revised day-by-day itinerary so the full
+    # output token budget is dedicated to keeping all requested days intact.
+    draft_itinerary = state.get("itinerary", "").strip() or _synthesize_draft_itinerary(state)
+    requested_days = _extract_requested_days(state)
+    day_rule = (
+        f"Preserve ALL {requested_days} days (### Day 1 through ### Day {requested_days}) in sequential order "
+        "with meaningful Morning, Afternoon, and Evening activities for every single day."
+        if requested_days
+        else "Preserve every day from the draft itinerary with meaningful activities for every single day."
+    )
 
-    final_prompt = f"""Generate the final travel response for the user.
+    flight_context = _summarize_text(state.get("flight_results", ""), max_chars=350)
+    hotel_context = _summarize_text(state.get("hotel_results", ""), max_chars=500)
+    weather_context = _summarize_text(state.get("weather_results", ""), max_chars=200)
+    budget_context = _summarize_text(state.get("budget_results", ""), max_chars=350)
 
-Human Review Status:
-{review_instruction}
+    revision_instructions = (
+        f"Revision Instructions:\n"
+        f"- Apply the user's feedback: '{feedback}'\n"
+        f"- {day_rule}\n"
+        "- Preserve unchanged days, landmarks, and practical details from the draft.\n"
+        "- Keep each day concise (`### Day X: <Theme>` with Morning/Afternoon/Evening bullets) so all days fit completely.\n"
+        "- Output ONLY the revised Day-by-Day Itinerary in Markdown (do not repeat Flight, Hotel, Weather, Budget, or Summary sections—those are preserved automatically)."
+    )
+
+    revision_prompt = f"""Revise the draft travel itinerary according to the user's feedback.
 
 User Request:
 {state['user_query']}
@@ -1003,48 +1234,54 @@ User Request:
 Trip Constraints:
 {state.get('trip_constraints', {})}
 
-Flight Highlights:
-{flight_summary}
+Specialist Context (for reference only):
+- Flights: {flight_context}
+- Hotels: {hotel_context}
+- Weather: {weather_context}
+- Budget: {budget_context}
 
-Hotel Highlights:
-{hotel_summary}
-
-Weather Highlights:
-{weather_summary}
-
-Budget Highlights:
-{budget_summary}
-
-Draft Itinerary to Polish/Finalize:
+Complete Draft Itinerary to Revise:
 {draft_itinerary}
 
-Format the final answer beautifully using these exact 7 sections:
-1. Trip Summary
-2. Flight Information
-3. Hotel Suggestions
-4. Weather Information
-5. Day-by-Day Itinerary
-6. Estimated Budget
-7. Final Recommendations
-
-Important guidelines:
-- Present clear, practical details in each section.
-- Incorporate human feedback when revision was requested.
-- Maintain a helpful, professional travel booking tone.
-- Keep the response concise and complete without extraneous filler.
+{revision_instructions}
 """
 
-    content, _ = _safe_llm_invoke(
-        system_prompt="You are a professional AI travel booking assistant. Return a clean, structured travel plan.",
-        user_prompt=final_prompt,
-        fallback_fn=lambda: _synthesize_final_response(state),
+    retry_prompt = f"""Revise the draft travel itinerary according to the user's feedback.
+
+User Request: {state['user_query']}
+Trip Constraints: {state.get('trip_constraints', {})}
+
+Complete Draft Itinerary to Revise:
+{draft_itinerary}
+
+{revision_instructions}
+"""
+
+    revised_itinerary, is_fallback = _safe_llm_invoke(
+        system_prompt=(
+            "You are a professional AI travel planner. Revise the provided itinerary to apply user "
+            "feedback while preserving every requested day and meaningful daily activities."
+        ),
+        user_prompt=revision_prompt,
+        fallback_fn=lambda: draft_itinerary,
         max_tokens=MAX_COMPLETION_TOKENS,
+        retry_user_prompt=retry_prompt,
     )
+
+    if not is_fallback and revised_itinerary.strip():
+        updated_state = dict(state)
+        updated_state["itinerary"] = revised_itinerary
+        content = _synthesize_final_response(updated_state)
+        result_itinerary = revised_itinerary
+    else:
+        content = _synthesize_final_response(state)
+        result_itinerary = draft_itinerary
 
     response = AIMessage(content=content)
 
     return {
         "final_response": content,
+        "itinerary": result_itinerary,
         "messages": [response],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }

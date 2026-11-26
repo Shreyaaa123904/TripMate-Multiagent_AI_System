@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>TripMate AI</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -90,9 +91,44 @@
         </div>
       </div>
 
-      <div id="pdfContent" class="pdf-content">
-        <h1 class="pdf-title">AI Travel Plan</h1>
-        <div id="resultBox" class="result-box"></div>
+      <div id="dayFilterBar" class="day-filter-bar hidden">
+        <span class="filter-label">Filter Day:</span>
+        <div id="dayFilterPills" class="day-filter-pills"></div>
+      </div>
+
+      <div class="split-view-container">
+        <div class="itinerary-panel">
+          <div id="pdfContent" class="pdf-content">
+            <h1 class="pdf-title">AI Travel Plan</h1>
+            <div id="resultBox" class="result-box"></div>
+          </div>
+        </div>
+
+        <div id="mapPanel" class="map-panel">
+          <div class="map-header">
+            <div class="map-header-title">
+              <span class="map-icon">🗺️</span>
+              <h3>Trip Visualization</h3>
+            </div>
+            <div class="map-legend">
+              <span class="legend-badge legend-attraction"><span class="legend-dot"></span> Attraction</span>
+              <span class="legend-badge legend-restaurant"><span class="legend-dot"></span> Dining</span>
+              <span class="legend-badge legend-market"><span class="legend-dot"></span> Market</span>
+              <span class="legend-badge legend-hotel"><span class="legend-dot"></span> Hotel</span>
+            </div>
+          </div>
+          <div id="mapContainer" class="map-container">
+            <div id="tripMap"></div>
+          </div>
+          <div id="mapStatus" class="map-status hidden"></div>
+          <div id="unmappedLocationsBox" class="unmapped-box hidden">
+            <div class="unmapped-header">
+              <span class="unmapped-icon">⚠️</span>
+              <span class="unmapped-title">Locations without map coordinates</span>
+            </div>
+            <ul id="unmappedLocationsList" class="unmapped-list"></ul>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -131,6 +167,7 @@
 
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
-  <script src="/static/script.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="/static/script.js?v=2.2"></script>
 </body>
 </html>

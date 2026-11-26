@@ -189,8 +189,9 @@ class TestTokenLimitsAndErrorHandling(unittest.TestCase):
         self.assertIn("Flight guidance", f_res["flight_results"])
 
     def test_prompt_character_and_token_safety_margin(self):
-        # Test that the prompt sent to final_agent stays well within the 8,000 TPM limit
-        state: TravelState = {
+        # Test that approved final_agent skips redundant LLM calls and revision final_agent
+        # stays well within the 8,000 TPM limit
+        base_state: TravelState = {
             "user_query": "Plan a 7-day vacation to Paris for 2 adults with $3500 budget",
             "trip_constraints": {
                 "destination": "Paris",
@@ -203,13 +204,34 @@ class TestTokenLimitsAndErrorHandling(unittest.TestCase):
             "hotel_results": "- **Hotel Le Marais**: Boutique stay in central Paris (~$180/night).\n- **Hotel Malte**: Opera district (~$160/night).",
             "weather_results": "Current in Paris: 17°C, mild. Forecast: 15-18°C with light scattered showers.",
             "budget_results": "Budget breakdown: Flights $1900, Hotel $1200, Food/Activities $400. Feasible with budget tracking.",
-            "itinerary": """# Day 1: Arrival & Seine Cruise
-# Day 2: Louvre Museum & Tuileries Garden
-# Day 3: Eiffel Tower & Champs-Élysées
-# Day 4: Montmartre & Sacré-Cœur
-# Day 5: Palace of Versailles Day Trip
-# Day 6: Latin Quarter & Notre Dame
-# Day 7: Souvenir Shopping & Departure""",
+            "itinerary": """### Day 1: Arrival & Seine Cruise
+- **Morning:** Arrive at CDG, transfer to Hotel Le Marais.
+- **Afternoon:** Stroll around Île de la Cité.
+- **Evening:** Evening Seine River cruise and bistro dinner.
+### Day 2: Louvre Museum & Tuileries Garden
+- **Morning:** Louvre Museum tour.
+- **Afternoon:** Walk through Tuileries Garden to Place de la Concorde.
+- **Evening:** Dinner in Palais-Royal.
+### Day 3: Eiffel Tower & Champs-Élysées
+- **Morning:** Visit Eiffel Tower and Trocadéro.
+- **Afternoon:** Walk Champs-Élysées to Arc de Triomphe.
+- **Evening:** Cafe dinner in the 7th arrondissement.
+### Day 4: Montmartre & Sacré-Cœur
+- **Morning:** Explore Sacré-Cœur and Place du Tertre.
+- **Afternoon:** Visit Musée d'Orsay.
+- **Evening:** Dinner in Pigalle.
+### Day 5: Palace of Versailles Day Trip
+- **Morning:** RER C to Versailles Palace.
+- **Afternoon:** Explore Versailles Gardens and Grand Trianon.
+- **Evening:** Return to Paris for dinner in Le Marais.
+### Day 6: Latin Quarter & Notre Dame
+- **Morning:** Visit Notre-Dame exterior and Sainte-Chapelle.
+- **Afternoon:** Browse Shakespeare and Company and Luxembourg Gardens.
+- **Evening:** Dinner along Rue Mouffetard.
+### Day 7: Souvenir Shopping & Departure
+- **Morning:** Morning coffee and macarons at Carette.
+- **Afternoon:** Last-minute shopping at Galeries Lafayette and airport transfer.
+- **Evening:** Depart Paris.""",
             "approved": True,
             "human_feedback": "",
             "llm_calls": 5,
@@ -217,12 +239,30 @@ class TestTokenLimitsAndErrorHandling(unittest.TestCase):
 
         captured_prompts = []
 
-        def mock_safe_invoke(system_prompt, user_prompt, fallback_fn=None, max_tokens=None):
+        def mock_safe_invoke(
+            system_prompt,
+            user_prompt,
+            fallback_fn=None,
+            max_tokens=None,
+            retry_user_prompt=None,
+        ):
             captured_prompts.append(user_prompt)
-            return "Sample final response", False
+            return base_state["itinerary"], False
+
+        # Approved draft should assemble deterministically with 0 LLM calls
+        with patch("backend._safe_llm_invoke", side_effect=mock_safe_invoke):
+            approved_res = final_agent(base_state)
+        self.assertEqual(len(captured_prompts), 0)
+        self.assertIn("Day 7", approved_res["final_response"])
+        self.assertEqual(approved_res["llm_calls"], 5)
+
+        # Revision path should invoke LLM with full itinerary within TPM safety margin
+        revision_state = dict(base_state)
+        revision_state["approved"] = False
+        revision_state["human_feedback"] = "Add a Seine river dinner on Day 2."
 
         with patch("backend._safe_llm_invoke", side_effect=mock_safe_invoke):
-            final_agent(state)
+            final_agent(revision_state)
 
         self.assertEqual(len(captured_prompts), 1)
         prompt = captured_prompts[0]

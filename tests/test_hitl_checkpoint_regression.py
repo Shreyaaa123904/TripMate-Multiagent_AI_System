@@ -429,6 +429,112 @@ class HITLCheckpointRegressionTests(unittest.TestCase):
         self.assertEqual(snapshot_final.next, (), "Resumed thread must complete to END")
         self.assertEqual(len(snapshot_final.tasks), 0, "No pending interrupt tasks remain on completed thread")
 
+    def test_four_turn_conversation_sequence_and_approval(self):
+        """
+        Verifies the full user requested conversation sequence:
+        1. "Plan a 7-day Nepal trip for 2 adults."
+        2. "My budget is $2,000."
+        3. "Change destination to Thailand."
+        4. "Make it 5 days."
+        Followed by human approval of the final 5-day Thailand plan.
+        """
+        thread_id = f"four_turn_{uuid.uuid4().hex}"
+        config = {"configurable": {"thread_id": thread_id}}
+
+        # Turn 1: "Plan a 7-day Nepal trip for 2 adults."
+        t1_input = StructuredTripState(
+            operation=TripOperation.NEW_TRIP,
+            destination=TripLocation(granularity=LocationGranularity.COUNTRY, country="Nepal"),
+            dates=TripDates(duration_days=7),
+            travellers=TravellerCounts(adults=2),
+        )
+        r1, _ = self._execute_turn(thread_id, "Plan a 7-day Nepal trip for 2 adults.", t1_input)
+        snap1 = self.app.get_state(config)
+        self.assertEqual(snap1.next, ("human_approval",))
+        draft1 = r1["__interrupt__"][0].value["draft_itinerary"]
+        self.assertIn("Nepal", draft1)
+        self.assertIn("7 days", draft1)
+
+        # Turn 2: "My budget is $2,000."
+        t2_input = StructuredTripState(
+            operation=TripOperation.UPDATE,
+            budget_amount=Decimal("2000"),
+            budget_currency="USD",
+        )
+        r2, _ = self._execute_turn(thread_id, "My budget is $2,000.", t2_input)
+        snap2 = self.app.get_state(config)
+        self.assertEqual(snap2.next, ("human_approval",))
+        draft2 = r2["__interrupt__"][0].value["draft_itinerary"]
+        self.assertIn("Nepal", draft2)
+        self.assertIn("7 days", draft2)
+        self.assertIn("USD 2000", draft2)
+
+        # Turn 3: "Change destination to Thailand."
+        t3_input = StructuredTripState(
+            operation=TripOperation.UPDATE,
+            destination=TripLocation(granularity=LocationGranularity.COUNTRY, country="Thailand"),
+        )
+        r3, _ = self._execute_turn(thread_id, "Change destination to Thailand.", t3_input)
+        snap3 = self.app.get_state(config)
+        self.assertEqual(snap3.next, ("human_approval",))
+        draft3 = r3["__interrupt__"][0].value["draft_itinerary"]
+        self.assertIn("Thailand", draft3)
+        self.assertNotIn("Nepal", draft3)
+        self.assertIn("USD 2000", draft3)
+
+        # Turn 4: "Make it 5 days."
+        t4_input = StructuredTripState(
+            operation=TripOperation.UPDATE,
+            dates=TripDates(duration_days=5),
+        )
+        r4, _ = self._execute_turn(thread_id, "Make it 5 days.", t4_input)
+        snap4 = self.app.get_state(config)
+        self.assertEqual(snap4.next, ("human_approval",))
+        draft4 = r4["__interrupt__"][0].value["draft_itinerary"]
+        self.assertIn("Thailand", draft4)
+        self.assertIn("5 days", draft4)
+        self.assertNotIn("7 days", draft4)
+        self.assertIn("USD 2000", draft4)
+
+        # Human Approval
+        resume_cmd = Command(resume={"approved": True, "feedback": "Approved!"})
+        final_result = self.app.invoke(resume_cmd, config=config)
+        snap_final = self.app.get_state(config)
+        self.assertEqual(snap_final.next, ())
+        final_doc = final_result.get("final_response", "")
+        self.assertIn("Thailand", final_doc)
+        self.assertIn("5 days", final_doc)
+        self.assertIn("USD 2000", final_doc)
+        self.assertNotIn("Nepal", final_doc)
+
+    def test_revision_feedback_workflow(self):
+        """
+        Verifies that when a draft is rejected with revision feedback,
+        the feedback is passed into the finalizer agent properly.
+        """
+        thread_id = f"feedback_{uuid.uuid4().hex}"
+        config = {"configurable": {"thread_id": thread_id}}
+
+        t1_input = StructuredTripState(
+            operation=TripOperation.NEW_TRIP,
+            destination=TripLocation(granularity=LocationGranularity.CITY, city="Tokyo"),
+            dates=TripDates(duration_days=4),
+        )
+        r1, _ = self._execute_turn(thread_id, "Plan a 4-day Tokyo trip.", t1_input)
+        snap1 = self.app.get_state(config)
+        self.assertEqual(snap1.next, ("human_approval",))
+
+        # Reject with feedback
+        feedback_text = "Please reduce hotel budget and add one free exploration afternoon."
+        resume_cmd = Command(resume={"approved": False, "feedback": feedback_text})
+        final_result = self.app.invoke(resume_cmd, config=config)
+
+        snap_final = self.app.get_state(config)
+        self.assertEqual(snap_final.next, ())
+        final_doc = final_result.get("final_response", "")
+        self.assertIn("Approved=False", final_doc)
+        self.assertIn(feedback_text, final_doc)
+
 
 if __name__ == "__main__":
     unittest.main()

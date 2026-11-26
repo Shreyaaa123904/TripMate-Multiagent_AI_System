@@ -46,7 +46,8 @@ def extract_structured_trip(message: str, llm: Any | None = None) -> TripExtract
 
     model = llm or _default_llm()
     try:
-        response = model.invoke(
+        invoke_model = model.bind(max_tokens=400) if hasattr(model, "bind") else model
+        response = invoke_model.invoke(
             [
                 SystemMessage(content=_system_prompt()),
                 HumanMessage(content=_user_prompt(user_message)),
